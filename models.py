@@ -174,8 +174,10 @@ class MatchBreakdown(BaseModel):
     experience_match: float
     education_match: float
     location_match: float
-    cultural_fit: float
-    overall_compatibility: float
+    stability: float = 0.0  # Stability score (0-100), default for backward compatibility
+    overqualified: float = 0.0  # Overqualified score (0-100), default for backward compatibility
+    cultural_fit: float = 0.0  # Kept for backward compatibility
+    overall_compatibility: float = 0.0  # Kept for backward compatibility
 
 class ResumeResultModel(BaseModel):
     """MongoDB Document Model for resume_result Collection"""

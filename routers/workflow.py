@@ -111,6 +111,25 @@ async def get_workflow_status(
         partial_fit_count = len([m for m in matches if 50 <= m.get("match_score", 0) < 80])
         not_fit_count = len([m for m in matches if m.get("match_score", 0) < 50])
         
+        # Use workflow document metrics if available (for live updates), otherwise use calculated values
+        workflow_metrics = recent_workflow.get("metrics", {}) if recent_workflow else {}
+        workflow_status = recent_workflow.get("status", "idle") if recent_workflow else "idle"
+        
+        if workflow_metrics and workflow_status == "in_progress":
+            # Use live metrics from workflow document during processing
+            candidates_scored = workflow_metrics.get("candidates_scored", len(matches))
+            high_matches_count = workflow_metrics.get("high_matches", len(high_matches))
+            best_fit = workflow_metrics.get("best_fit", best_fit_count)
+            partial_fit = workflow_metrics.get("partial_fit", partial_fit_count)
+            not_fit = workflow_metrics.get("not_fit", not_fit_count)
+        else:
+            # Calculate from database (for completed workflows or when metrics not available)
+            candidates_scored = len(matches)
+            high_matches_count = len(high_matches)
+            best_fit = best_fit_count
+            partial_fit = partial_fit_count
+            not_fit = not_fit_count
+        
         # Build agent statuses
         # Note: Only HR Comparator is actual AI agent
         # JD Reader and Resume Reader are direct parsing steps, not AI agents
@@ -160,18 +179,33 @@ async def get_workflow_status(
         
         if recent_workflow:
             workflow_status = recent_workflow.get("status", "pending")
+            processed_resumes = recent_workflow.get("processed_resumes", 0)
+            total_resumes_to_process = len(resume_ids) if resume_ids else total_resumes
+            
             print(f"   Workflow status: {workflow_status}")
             print(f"   Total matches: {total_matches}")
+            print(f"   Processed: {processed_resumes}/{total_resumes_to_process}")
             
-            if total_matches > 0:
-                # Has results - completed
+            # Check if workflow is actually completed AND all resumes processed
+            if workflow_status == "completed" and processed_resumes >= total_resumes_to_process:
+                # Workflow is fully completed
                 hr_comparator_status = "completed"
                 hr_comparator_description = f"AI-powered matching: Compared and scored {total_matches} candidate(s)"
             elif workflow_status == "in_progress":
-                # Workflow is actively running
-                hr_comparator_status = "in-progress"
-                hr_comparator_description = f"AI agent analyzing {total_resumes} candidates in real-time..."
-                print(f"   ⚡ HR Comparator: IN PROGRESS")
+                # Workflow is actively running - check if all resumes are processed
+                if processed_resumes >= total_resumes_to_process and total_matches > 0:
+                    # All resumes processed but workflow not marked completed yet
+                    hr_comparator_status = "in-progress"
+                    hr_comparator_description = f"Finalizing results: {processed_resumes}/{total_resumes_to_process} processed, {total_matches} scored"
+                else:
+                    # Still processing
+                    hr_comparator_status = "in-progress"
+                    hr_comparator_description = f"AI agent analyzing {processed_resumes}/{total_resumes_to_process} candidates in real-time..."
+                print(f"   ⚡ HR Comparator: IN PROGRESS ({processed_resumes}/{total_resumes_to_process})")
+            elif total_matches > 0 and workflow_status != "in_progress":
+                # Has results but workflow status is not in_progress (might be completed)
+                hr_comparator_status = "completed"
+                hr_comparator_description = f"AI-powered matching: Compared and scored {total_matches} candidate(s)"
             elif workflow_status == "pending" and total_resumes > 0 and total_jds > 0:
                 # Ready to start but not started yet
                 hr_comparator_status = "pending"
@@ -190,9 +224,9 @@ async def get_workflow_status(
             "is_ai_agent": True,  # This is the ONLY real AI agent
             "metrics": {
                 "candidateProfiles": total_resumes,
-                "candidatesScored": total_matches,
-                "highMatches": len(high_matches),
-                "topMatches": f"{len(high_matches)} candidates ready" if len(high_matches) > 0 else "Processing..."
+                "candidatesScored": candidates_scored,
+                "highMatches": high_matches_count,
+                "topMatches": f"{high_matches_count} candidates ready" if high_matches_count > 0 else "Processing..."
             }
         })
         
@@ -221,7 +255,6 @@ async def get_workflow_status(
                 )
         
         # Determine if we should continue monitoring
-        workflow_status = recent_workflow.get("status", "idle")
         should_monitor = workflow_status in ["in_progress", "pending"]
         
         return {
@@ -232,10 +265,12 @@ async def get_workflow_status(
                 "totalCandidates": total_resumes,
                 "processingTime": f"{total_processing_time:.1f}s" if total_processing_time > 0 else "0s",
                 "matchRate": f"{int(match_rate)}%" if matches else "0%",
-                "topMatches": len(high_matches),
-                "bestFit": best_fit_count,
-                "partialFit": partial_fit_count,
-                "notFit": not_fit_count
+                "topMatches": high_matches_count,
+                "candidatesScored": candidates_scored,
+                "highMatches": high_matches_count,
+                "bestFit": best_fit,
+                "partialFit": partial_fit,
+                "notFit": not_fit
             },
             "progress": {
                 "completed": completed_agents,

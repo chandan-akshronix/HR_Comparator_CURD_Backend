@@ -180,6 +180,7 @@ class ResumeResultListResponse(BaseModel):
     skills_matched: Optional[List[str]] = None
     match_score: float
     fit_category: FitCategory
+    selection_reason: Optional[str] = ""  # Add selection_reason to schema
     match_breakdown: Optional[Dict[str, Any]] = None
     timestamp: datetime
     

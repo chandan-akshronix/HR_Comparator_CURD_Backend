@@ -8,7 +8,7 @@ import json
 
 import schemas
 import crud
-from database import get_db
+from database import get_db, RESUME_RESULT_COLLECTION
 from routers.auth import get_current_user
 from config import AI_AGENT_URL, AI_AGENT_TIMEOUT, AI_AGENT_ENABLED
 
@@ -75,6 +75,8 @@ def mock_ai_matching(resume_text: str, jd_text: str) -> dict:
             "experience_match": 90.0,
             "education_match": 100.0,
             "location_match": 85.0,
+            "stability": 80.0,
+            "overqualified": 0.0,
             "cultural_fit": 80.0,
             "overall_compatibility": 85.5
         },
@@ -83,7 +85,7 @@ def mock_ai_matching(resume_text: str, jd_text: str) -> dict:
         "processing_duration_ms": 2500
     }
 
-async def call_ai_agent_batch(workflow_id: str, jd_text: str, resumes: List[dict]) -> dict:
+async def call_ai_agent_batch(workflow_id: str, jd_id: str, jd_text: str, resumes: List[dict]) -> dict:
     """
     Call AI Agent container to process multiple resumes
     
@@ -127,6 +129,7 @@ async def call_ai_agent_batch(workflow_id: str, jd_text: str, resumes: List[dict
                 f"{AI_AGENT_URL}/compare-batch",
                 json={
                     "workflow_id": workflow_id,
+                    "jd_id": jd_id,  # Pass jd_id for live updates
                     "jd_text": jd_text,
                     "resumes": resumes
                 }
@@ -337,6 +340,7 @@ async def batch_match_resumes(  # ✅ Made async!
         print(f"🤖 Calling AI Agent for workflow: {workflow_id}")
         ai_results = await call_ai_agent_batch(
             workflow_id=workflow_id,
+            jd_id=str(batch_request.jd_id),  # Pass jd_id for live updates
             jd_text=jd.get("description", ""),
             resumes=resumes_data
         )
@@ -344,51 +348,114 @@ async def batch_match_resumes(  # ✅ Made async!
         print(f"✅ AI Agent completed for workflow: {workflow_id}")
         print(f"📊 Received {len(ai_results.get('results', []))} results from AI Agent")
         
-        # Save results to database
+        # Save results to database in batches for live updates
         processed_count = 0
         failed_count = 0
         total_results = len(ai_results.get("results", []))
+        BATCH_SIZE = 10  # Update workflow every 10 saves for better performance and live updates
         
-        for idx, result in enumerate(ai_results.get("results", []), 1):
+        print(f"💾 Saving {total_results} results to database in batches of {BATCH_SIZE}...")
+        
+        # Prepare all result documents first
+        result_docs_to_insert = []
+        resume_ids_to_check = []
+        
+        for result in ai_results.get("results", []):
+            resume_ids_to_check.append(crud.object_id(result["resume_id"]))
+            result_docs_to_insert.append({
+                "resume_id": crud.object_id(result["resume_id"]),
+                "jd_id": batch_request.jd_id,
+                "workflow_id": workflow_id,
+                "match_score": result.get("match_score", 0),
+                "fit_category": result.get("fit_category", "Unknown"),
+                "jd_extracted": result.get("jd_extracted", {}),
+                "resume_extracted": result.get("resume_extracted", {}),
+                "match_breakdown": result.get("match_breakdown", {}),
+                "selection_reason": result.get("selection_reason", ""),
+                "agent_version": "v1.0.0",
+                "processing_duration_ms": ai_results.get("processing_time_ms", 0),
+                "confidence_score": result.get("confidence_score", "Unknown"),
+                "timestamp": datetime.utcnow()
+            })
+        
+        # Delete existing results in bulk (if any)
+        if resume_ids_to_check:
+            existing_deleted = db[RESUME_RESULT_COLLECTION].delete_many({
+                "resume_id": {"$in": resume_ids_to_check},
+                "jd_id": batch_request.jd_id
+            })
+            if existing_deleted.deleted_count > 0:
+                print(f"🔄 Deleted {existing_deleted.deleted_count} existing results")
+        
+        # Insert results in batches for live updates
+        for batch_start in range(0, len(result_docs_to_insert), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(result_docs_to_insert))
+            batch = result_docs_to_insert[batch_start:batch_end]
+            
             try:
-                print(f"💾 [{idx}/{total_results}] Saving result for resume: {result.get('resume_id', 'unknown')}")
-                result_doc = {
-                    "resume_id": crud.object_id(result["resume_id"]),
-                    "jd_id": batch_request.jd_id,
-                    "workflow_id": workflow_id,  # Added workflow_id
-                    "match_score": result.get("match_score", 0),
-                    "fit_category": result.get("fit_category", "Unknown"),
-                    "jd_extracted": result.get("jd_extracted", {}),
-                    "resume_extracted": result.get("resume_extracted", {}),
-                    "match_breakdown": result.get("match_breakdown", {}),
-                    "selection_reason": result.get("selection_reason", ""),
-                    "agent_version": "v1.0.0",
-                    "processing_duration_ms": ai_results.get("processing_time_ms", 0),
-                    "confidence_score": result.get("confidence_score", "Unknown")
-                }
+                # Bulk insert this batch
+                insert_result = db[RESUME_RESULT_COLLECTION].insert_many(batch)
+                processed_count += len(batch)
+                print(f"✅ Saved batch {batch_start//BATCH_SIZE + 1}: {len(batch)} results ({processed_count}/{total_results})")
                 
-                # Check if result already exists
-                existing_result = crud.get_result_by_resume_jd(
-                    db, result["resume_id"], batch_request.jd_id
-                )
+                # Update workflow progress after each batch
+                current_matches = list(db[RESUME_RESULT_COLLECTION].find({
+                    "workflow_id": workflow_id,
+                    "jd_id": batch_request.jd_id
+                }))
+                high_matches_count = len([m for m in current_matches if m.get("match_score", 0) >= 80])
+                best_fit = len([m for m in current_matches if m.get("match_score", 0) >= 80])
+                partial_fit = len([m for m in current_matches if 50 <= m.get("match_score", 0) < 80])
+                not_fit = len([m for m in current_matches if m.get("match_score", 0) < 50])
                 
-                if existing_result:
-                    print(f"🔄 Deleting existing result: {existing_result['_id']}")
-                    crud.delete_result(db, existing_result["_id"])
+                # Update workflow with live progress
+                crud.update_workflow_status(db, workflow_id, {
+                    "processed_resumes": processed_count,
+                    "progress": {
+                        "completed_agents": 2,  # JD Reader and Resume Reader are done
+                        "total_agents": 3,
+                        "percentage": int((processed_count / total_results) * 100) if total_results > 0 else 0,
+                        "processed_count": processed_count,
+                        "total_count": total_results
+                    },
+                    "metrics": {
+                        "candidates_scored": len(current_matches),
+                        "high_matches": high_matches_count,
+                        "best_fit": best_fit,
+                        "partial_fit": partial_fit,
+                        "not_fit": not_fit
+                    }
+                })
+                print(f"📊 Updated workflow: {processed_count}/{total_results} ({int((processed_count / total_results) * 100)}%) - {len(current_matches)} scored, {high_matches_count} high matches")
                 
-                result_id = crud.create_resume_result(db, result_doc)
-                print(f"✅ [{idx}/{total_results}] Saved result with ID: {result_id}")
-                processed_count += 1
-            except Exception as save_error:
-                failed_count += 1
-                print(f"❌ [{idx}/{total_results}] Error saving result for resume {result.get('resume_id', 'unknown')}: {save_error}")
+            except Exception as batch_error:
+                failed_count += len(batch)
+                print(f"❌ Error saving batch {batch_start//BATCH_SIZE + 1}: {batch_error}")
                 import traceback
                 traceback.print_exc()
-                # Continue with next resume even if this one fails
+                # Try to save individually if batch fails
+                for doc in batch:
+                    try:
+                        db[RESUME_RESULT_COLLECTION].insert_one(doc)
+                        processed_count += 1
+                        failed_count -= 1
+                    except:
+                        pass
         
         print(f"📊 Save summary: {processed_count} succeeded, {failed_count} failed out of {total_results} total")
         
-        # Update workflow status to completed
+        # Calculate final metrics from database
+        final_matches = list(db[RESUME_RESULT_COLLECTION].find({
+            "workflow_id": workflow_id,
+            "jd_id": batch_request.jd_id
+        }))
+        final_high_matches = len([m for m in final_matches if m.get("match_score", 0) >= 80])
+        final_best_fit = len([m for m in final_matches if m.get("match_score", 0) >= 80])
+        final_partial_fit = len([m for m in final_matches if 50 <= m.get("match_score", 0) < 80])
+        final_not_fit = len([m for m in final_matches if m.get("match_score", 0) < 50])
+        final_match_rate = (final_high_matches / len(final_matches) * 100) if final_matches else 0
+        
+        # Update workflow status to completed with final metrics
         crud.update_workflow_status(db, workflow_id, {
             "status": "completed",
             "completed_at": datetime.utcnow(),
@@ -412,19 +479,31 @@ async def batch_match_resumes(  # ✅ Made async!
                     "status": "completed",
                     "is_ai_agent": True,
                     "completed_at": datetime.utcnow(),
-                    "duration_ms": ai_results.get("processing_time_ms", 0)
+                    "duration_ms": ai_results.get("processing_time_ms", 0),
+                    "metrics": {
+                        "candidatesScored": len(final_matches),
+                        "highMatches": final_high_matches,
+                        "topMatches": final_high_matches
+                    }
                 }
             ],
             "progress": {
                 "completed_agents": 3,
                 "total_agents": 3,
-                "percentage": 100
+                "percentage": 100,
+                "processed_count": processed_count,
+                "total_count": total_results
             },
             "metrics": {
                 "total_candidates": len(resume_ids),
+                "candidates_scored": len(final_matches),
                 "processing_time_ms": ai_results.get("processing_time_ms", 0),
-                "match_rate": 100,
-                "top_matches": processed_count
+                "match_rate": final_match_rate,
+                "top_matches": final_high_matches,
+                "high_matches": final_high_matches,
+                "best_fit": final_best_fit,
+                "partial_fit": final_partial_fit,
+                "not_fit": final_not_fit
             }
         })
         
@@ -644,12 +723,13 @@ def get_top_matches(
             print(f"   ⚠️ Skills is dict, will flatten: {list(tech_skills.keys())}")
         
         # Extract current position from Career_History if available
+        # Note: Career_History is now ordered with MOST RECENT position FIRST (per updated prompt)
         current_position = resume_data.get("Current_Position") or resume_data.get("current_position")
         if not current_position and resume_data.get("Career_History"):
             career = resume_data.get("Career_History", [])
             if isinstance(career, list) and len(career) > 0:
-                # Get most recent role
-                latest_job = career[-1] if career else {}
+                # Get most recent role (first entry in reverse chronological order)
+                latest_job = career[0]  # First entry is the most recent
                 current_position = latest_job.get("Role") or latest_job.get("Job_Title")
         
         # Get workflow_id from map
@@ -682,11 +762,13 @@ def get_top_matches(
             "skills_matched": flatten_skills(resume_data.get("Technical_Skills") or resume_data.get("skills_matched") or []),
             "match_score": result["match_score"],
             "fit_category": result["fit_category"],
+            "selection_reason": result.get("selection_reason", ""),  # Add selection_reason to response
             "match_breakdown": {
                 "skills_match": int(match_breakdown.get("Skill_Score") or match_breakdown.get("skills_match") or 0),
                 "experience_match": int(match_breakdown.get("Experience_Score") or match_breakdown.get("experience_match") or 0),
-                "location_match": int(match_breakdown.get("Location_Score") or match_breakdown.get("location_match") or 0),
-                "stability": int(result.get("stability_score") or match_breakdown.get("cultural_fit") or 0)
+                "location_match": int(match_breakdown.get("Location_Score") or match_breakdown.get("location_match") or 0),                # Use LLM's Stability_Score if available, otherwise fallback to algorithmic stability_score
+                "stability": int(match_breakdown.get("Stability_Score") or result.get("stability_score") or match_breakdown.get("cultural_fit") or 0),
+                "overqualified": int(match_breakdown.get("Overqualified_Score") or 0)
             },
             "timestamp": result["timestamp"]
         })
